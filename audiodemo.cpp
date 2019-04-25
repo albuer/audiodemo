@@ -13,6 +13,8 @@
 // limitations under the License.
 
 //
+#define LOG_TAG "AudioDemo"
+#include <utils/Log.h>
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -287,13 +289,15 @@ int Playback() {
     }
 
     printf("start playing.\n");
+    ALOGD("setVolume 0\n");
+    track->setVolume(0.0f);
     isPlaying = true;
     if (track->start() != NO_ERROR) {
         fprintf(stderr, "playback start failed, now exiting\n");
         fclose(fp);
         return -1;
     }
-
+    nsecs_t start_tm = systemTime();
     int sampleCount = gOutSampleRate/10;
     int frameSize = gOutChannelNum*gOutBits/8;
     char* output = new char[frameSize*sampleCount];
@@ -301,9 +305,18 @@ int Playback() {
         size_t readCount = fread(output, frameSize, sampleCount, fp);
         printf("read sample count %zu\n", readCount);
         witreAudio(track, output, readCount, frameSize);
+        if ((systemTime() - start_tm) >= 50*1000*1000) {
+            ALOGD("setVolume 1\n");
+            track->setVolume(1.0f);
+        }
     }
 
-    printf("playback stop.\n");
+    ALOGD("setVolume 0\n");
+    track->setVolume(0.0f);
+    ALOGD("pause\n");
+    track->pause();
+    usleep(50*1000);
+    ALOGD("stop\n");
     track->stop();
     delete []output;
     fclose(fp);
@@ -335,6 +348,65 @@ int CheckRecordParams()
 
     if (gInBits!=8 && gInBits!=16 && gInBits!=32)
         return -3;
+
+    return 0;
+}
+
+#include <audio_utils/resampler.h>
+// ./audiodemo -m 3 -c 2 -b 16 -r 32000,44100
+int Resample()
+{
+    int ret;
+    struct resampler_itfe *ri;
+    ret = create_resampler(gInSampleRate, gOutSampleRate, gChannelNum,
+                            RESAMPLER_QUALITY_DEFAULT, NULL, &ri);
+    printf("create_resampler return %d\n", ret);
+    if (ret != 0) {
+        return -1;
+    }
+
+    FILE* fpin = fopen("32000.pcm", "rb");
+    if (fpin == NULL) {
+        printf("fail open 32000.pcm\n");
+        release_resampler(ri);
+        return -1;
+    }
+    FILE* fpout = fopen("44100.pcm", "wb");
+    if (fpout == NULL) {
+        printf("fail open 44100.pcm\n");
+        release_resampler(ri);
+        fclose(fpin);
+        return -1;
+    }
+
+    size_t frame_size = gChannelNum * (gBits>>3);
+    int8_t* inbuf = new int8_t[gInSampleRate*frame_size];
+    int8_t* outbuf = new int8_t[gOutSampleRate*frame_size];
+    size_t inFrameCount, outFrameCount;
+
+    while (1) {
+        int in_bytes = fread(inbuf, 1, gInSampleRate*frame_size, fpin);
+        if (in_bytes <= 0) {
+            printf("EOF\n");
+            break;
+        }
+        inFrameCount = in_bytes/frame_size;
+        outFrameCount = inFrameCount*gOutSampleRate/gInSampleRate;
+
+        ret = ri->resample_from_input(ri, (int16_t*)inbuf, &inFrameCount, (int16_t*)outbuf, &outFrameCount);
+        printf("resampler: in %zu, out %zu\n", inFrameCount, outFrameCount);
+        if (ret < 0) {
+            printf("resample failed %d\n", ret);
+            break;
+        }
+        fwrite(outbuf, 1, outFrameCount*frame_size, fpout);
+    }
+
+    release_resampler(ri);
+    fclose(fpin);
+    fclose(fpout);
+    delete []inbuf;
+    delete []outbuf;
 
     return 0;
 }
@@ -387,6 +459,9 @@ int exectue() {
 
         printf("from source %d to stream %d\n", gInDevice, gOutDevice);
         RecordAndPlayback();
+    } else if (gMode == 3) {
+        // resampler
+        Resample();
     }
 
     return 0;
