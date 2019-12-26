@@ -12,18 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//
-#define LOG_TAG "AudioDemo"
-#include <utils/Log.h>
-
 #include <stdlib.h>
 #include <stdio.h>
 #include <math.h>
 #include <fcntl.h>
+#include <getopt.h>
 
 #include <media/AudioSystem.h>
 #include <media/AudioTrack.h>
 #include <media/AudioRecord.h>
+
+#include <audio_utils/resampler.h>
 
 namespace android {
 
@@ -33,30 +32,75 @@ namespace android {
 *
 ************************************************************/
 
-int             gDevice = -2;
 audio_source_t      gInDevice = AUDIO_SOURCE_MIC;
 audio_stream_type_t gOutDevice = AUDIO_STREAM_MUSIC;
 
-int             gChannelNum = 2;
-int             gInChannelNum = 2;
-int             gOutChannelNum = 2;
+#define         CHANNEL_NUM     2
+#define         SAMPLE_RATE     44100
+#define         SAMPLE_BITS     16
+#define         SINE_FREQ       500
+#define         SINE_TIME_SEC   60
 
-int             gSampleRate = 44100;
-int             gInSampleRate = 44100;
-int             gOutSampleRate = 44100;
+int             gInChannelNum = -1;
+int             gOutChannelNum = -1;
 
-int             gBits = 16;
-int             gInBits = 16;
-int             gOutBits = 16;
+int             gInSampleRate = -1;
+int             gOutSampleRate = -1;
 
-int             gMode = 0; // 0 - playback, 1 - record, 2 - record and playback
-char            gFile[512] = "";
+int             gInBits = -1;
+int             gOutBits = -1;
+
+char            gInFile[512] = "";
+char            gOutFile[512] = "";
 
 bool            isPlaying = false;
 bool            isRecording = false;
 
+int             gResample = -1;
+int             gSineFreq = -1;
+int             gSineTime = SINE_TIME_SEC;
+
+#undef RAMP_VOLUME
+
+int CheckPlaybackParams()
+{
+    if (gOutDevice<AUDIO_STREAM_DEFAULT || gOutDevice>AUDIO_STREAM_PUBLIC_CNT)
+        return -1;
+
+    if (gOutChannelNum!=1 && gOutChannelNum!=2)
+        return -2;
+
+    if (gOutBits!=8 && gOutBits!=16 && gOutBits!=32)
+        return -3;
+
+    return 0;
+}
+
+int CheckRecordParams()
+{
+    if (gInDevice<AUDIO_SOURCE_DEFAULT || gInDevice>AUDIO_SOURCE_CNT)
+        return -1;
+
+    if (gInChannelNum!=1 && gInChannelNum!=2)
+        return -2;
+
+    if (gInBits!=8 && gInBits!=16 && gInBits!=32)
+        return -3;
+
+    return 0;
+}
+
 sp<AudioTrack> allocAudioTrack(void)
 {
+    if (gOutChannelNum < 0) gOutChannelNum = CHANNEL_NUM;
+    if (gOutSampleRate < 0) gOutSampleRate = SAMPLE_RATE;
+    if (gOutBits < 0) gOutBits = SAMPLE_BITS;
+
+    if (CheckPlaybackParams() != 0) {
+        printf("Invalid playback params!\n");
+        return NULL;
+    }
+
     int sampleRate = gOutSampleRate;
     size_t frameCount = 0;
     int channel = (gOutChannelNum<=1)?AUDIO_CHANNEL_OUT_MONO:AUDIO_CHANNEL_OUT_STEREO;
@@ -78,8 +122,8 @@ sp<AudioTrack> allocAudioTrack(void)
         fprintf(stderr, "cannot compute frame count\n");
         return NULL;
     }
-    printf("for stream(%d): rate %d, frameCount %zu, channel 0x%x, pcmFormat 0x%x\n",
-            gOutDevice, sampleRate, frameCount, channel, aFormat);
+    printf("for stream(%d): rate %d, channel %d, bits %d, frameCount %zu\n",
+            gOutDevice, sampleRate, gOutChannelNum, gOutBits, frameCount);
 
     sp<AudioTrack> track = new AudioTrack();
     if (track->set(gOutDevice, sampleRate, aFormat,
@@ -96,6 +140,15 @@ sp<AudioTrack> allocAudioTrack(void)
 
 sp<AudioRecord> allocAudioRecord(void)
 {
+    if (gInChannelNum < 0) gInChannelNum = CHANNEL_NUM;
+    if (gInSampleRate < 0) gInSampleRate = SAMPLE_RATE;
+    if (gInBits < 0) gInBits = SAMPLE_BITS;
+
+    if (CheckRecordParams() != 0) {
+        printf("Invalid record params!\n");
+        return NULL;
+    }
+
     int sampleRate = gInSampleRate;
     size_t frameCount = 0;
     audio_format_t aFormat = AUDIO_FORMAT_PCM_16_BIT;
@@ -118,8 +171,8 @@ sp<AudioRecord> allocAudioRecord(void)
         fprintf(stderr, "cannot compute frame count\n");
         return NULL;
     }
-    printf("for source(%d): rate %d, frameCount %zu, channel 0x%x, pcmFormat 0x%x\n",
-            gInDevice, sampleRate, frameCount, channel, aFormat);
+    printf("for source(%d): rate %d, channel %d, bits %d, frameCount %zu\n",
+            gInDevice, sampleRate, gInChannelNum, gInBits, frameCount);
 
     sp<AudioRecord> record = new AudioRecord(String16("AudioDemo"));
     if (record->set(gInDevice, sampleRate, aFormat,
@@ -131,6 +184,54 @@ sp<AudioRecord> allocAudioRecord(void)
     printf("alloc AudioRecord success. latency: %d ms\n", record->latency());
 
     return record;
+}
+
+int ParseWav(FILE* fp)
+{
+    typedef struct WAVE_FMT{
+        char  fccID[4];
+        unsigned int size;
+        unsigned short format_tag;
+        unsigned short channels;
+        unsigned int sample_rate;
+        unsigned int bytes_per_sec;
+        unsigned short block_align;
+        unsigned short bits_per_sample;
+    }WAVE_FMT;
+
+    typedef struct WAVE_DATA{
+        char fccID[4];
+        unsigned int size;
+    }WAVE_DATA;
+
+    typedef struct WAVE_HEADER{
+        char fccID[4];
+        unsigned int size;
+        char fccType[4];
+        WAVE_FMT fmt_header;
+        WAVE_DATA data_header;
+    }WAVE_HEADER;
+
+    WAVE_HEADER wav_header;
+    size_t readCount = fread(&wav_header, 1, sizeof(WAVE_HEADER), fp);
+    if (readCount != sizeof(WAVE_HEADER)) {
+        return -1;
+    }
+
+    if (strncasecmp(wav_header.fccID, "RIFF", 4) != 0 || strncasecmp(wav_header.fccType, "WAVE", 4) != 0) {
+        printf("invalid fcc %s %s\n", wav_header.fccID, wav_header.fccType);
+        return -1;
+    }
+    if (wav_header.fmt_header.format_tag != 1) { // not PCM
+        return -2;
+    }
+    gInChannelNum = wav_header.fmt_header.channels;
+    gInSampleRate = wav_header.fmt_header.sample_rate;
+    gInBits = wav_header.fmt_header.bits_per_sample;
+
+    printf("WAV file: channels=%d, rate=%d, bits=%d\n", gInChannelNum, gInSampleRate, gInBits);
+
+    return 0;
 }
 
 int readAudio(sp<AudioRecord> record, char* data, int sampleCount, int frameSize)
@@ -240,9 +341,9 @@ int Record() {
     }
 
     FILE *fp = NULL;
-    fp = fopen(gFile, "wb");
+    fp = fopen(gOutFile, "wb");
     if (fp == NULL) {
-        fprintf(stderr, "Failed to create file: %s\n", gFile);
+        fprintf(stderr, "Failed to create file: %s\n", gOutFile);
         return -1;
     }
 
@@ -258,128 +359,150 @@ int Record() {
 
     int sampleCount = gInSampleRate/10;
     int frameSize = gInChannelNum*gInBits/8;
-    char* input = new char[frameSize*sampleCount];
+    char* buffer = new char[frameSize*sampleCount];
     while (isRecording) {
-        int readCount = readAudio(record, input, sampleCount, frameSize);
-        fwrite(input, frameSize, readCount, fp);
+        int readCount = readAudio(record, buffer, sampleCount, frameSize);
+        fwrite(buffer, frameSize, readCount, fp);
         printf("write sample count %d\n", readCount);
         fflush(fp);
     }
 
     printf("record stop\n");
     record->stop();
-    delete []input;
+    delete []buffer;
     fclose(fp);
 
     return 0;
 }
 
+#ifdef RAMP_VOLUME
+void rampVolume(int16_t* data, int frameCount, bool up)
+{
+    printf("ramp volume %d\n", frameCount);
+    int16_t *in = data;
+    int16_t* out = data;
+    float vl = up?0.0f:1.0f;
+    const float vlInc = (up?1.0f:-1.0f)/frameCount;
+
+    do {
+        float a = vl*(float)*in;
+        *out++ = (int16_t)a;
+        *out++ = (int16_t)a;
+        in += 2;
+        vl += vlInc;
+    } while (--frameCount);
+}
+#endif
+
 int Playback() {
+    FILE *fp = NULL;
+    fp = fopen(gInFile, "rb");
+    if (fp == NULL) {
+        fprintf(stderr, "Failed to open file: %s\n", gInFile);
+        return -1;
+    }
+    if (strstr(gInFile, ".wav")) {
+        if (ParseWav(fp) < 0) {
+            fprintf(stderr, "Invalid wav file!\n");
+            fclose(fp);
+            return -1;
+        }
+        if (gOutChannelNum < 0) gOutChannelNum = gInChannelNum;
+        if (gOutSampleRate < 0) gOutSampleRate = gInSampleRate;
+        if (gOutBits < 0) gOutBits = gInBits;
+    } else {
+        if (gInChannelNum < 0) gInChannelNum = CHANNEL_NUM;
+        if (gInSampleRate < 0) gInSampleRate = SAMPLE_RATE;
+        if (gInBits < 0) gInBits = SAMPLE_BITS;
+        printf("PCM file: channels=%d, rate=%d, bits=%d\n", gInChannelNum, gInSampleRate, gInBits);
+    }
+
     sp<AudioTrack> track = allocAudioTrack();
     if(track == NULL) {
         printf("Setup audio track fail!\n");
-        return -1;
-    }
-
-    FILE *fp = NULL;
-    fp = fopen(gFile, "rb");
-    if (fp == NULL) {
-        fprintf(stderr, "Failed to open file: %s\n", gFile);
+        fclose(fp);
         return -1;
     }
 
     printf("start playing.\n");
-    ALOGD("setVolume 0\n");
-    track->setVolume(0.0f);
+//    printf("setVolume 0\n");
+//    track->setVolume(0.0f);
     isPlaying = true;
     if (track->start() != NO_ERROR) {
         fprintf(stderr, "playback start failed, now exiting\n");
         fclose(fp);
         return -1;
     }
-    nsecs_t start_tm = systemTime();
-    int sampleCount = gOutSampleRate/10;
-    int frameSize = gOutChannelNum*gOutBits/8;
-    char* output = new char[frameSize*sampleCount];
+//    nsecs_t start_tm = systemTime();
+    int sampleCount = gInSampleRate/10;
+    int frameSize = gInChannelNum*gInBits/8;
+    char* buffer = new char[frameSize*sampleCount];
+#ifdef RAMP_VOLUME
+    int isFirst = 1;
+#endif
     while (!feof(fp) && isPlaying) {
-        size_t readCount = fread(output, frameSize, sampleCount, fp);
+        size_t readCount = fread(buffer, frameSize, sampleCount, fp);
         printf("read sample count %zu\n", readCount);
-        witreAudio(track, output, readCount, frameSize);
-        if ((systemTime() - start_tm) >= 50*1000*1000) {
-            ALOGD("setVolume 1\n");
-            track->setVolume(1.0f);
+#ifdef RAMP_VOLUME
+        if (isFirst) {
+            isFirst = 0;
+            rampVolume((int16_t*)buffer, readCount, true);
         }
+#endif
+        witreAudio(track, buffer, readCount, frameSize);
     }
 
-    ALOGD("setVolume 0\n");
+#ifdef RAMP_VOLUME
+    printf("setVolume 0\n");
     track->setVolume(0.0f);
-    ALOGD("pause\n");
+    printf("pause\n");
     track->pause();
     usleep(50*1000);
-    ALOGD("stop\n");
+#endif
+
+    printf("playback stop\n");
     track->stop();
-    delete []output;
+    delete []buffer;
     fclose(fp);
 
     return 0;
 }
 
-int CheckPlaybackParams()
-{
-    if (gOutDevice<AUDIO_STREAM_DEFAULT || gOutDevice>AUDIO_STREAM_PUBLIC_CNT)
-        return -1;
-
-    if (gOutChannelNum!=1 && gOutChannelNum!=2)
-        return -2;
-
-    if (gOutBits!=8 && gOutBits!=16 && gOutBits!=32)
-        return -3;
-
-    return 0;
-}
-
-int CheckRecordParams()
-{
-    if (gInDevice<AUDIO_SOURCE_DEFAULT || gInDevice>AUDIO_SOURCE_CNT)
-        return -1;
-
-    if (gInChannelNum!=1 && gInChannelNum!=2)
-        return -2;
-
-    if (gInBits!=8 && gInBits!=16 && gInBits!=32)
-        return -3;
-
-    return 0;
-}
-
-#include <audio_utils/resampler.h>
-// ./audiodemo -m 3 -c 2 -b 16 -r 32000,44100
 int Resample()
 {
     int ret;
     struct resampler_itfe *ri;
-    ret = create_resampler(gInSampleRate, gOutSampleRate, gChannelNum,
-                            RESAMPLER_QUALITY_DEFAULT, NULL, &ri);
-    printf("create_resampler return %d\n", ret);
+
+    if (gInChannelNum < 0) gInChannelNum = CHANNEL_NUM;
+    if (gInSampleRate < 0) gInSampleRate = SAMPLE_RATE;
+    if (gInBits < 0) gInBits = SAMPLE_BITS;
+
+    if (gOutSampleRate < 0) gOutSampleRate = SAMPLE_RATE;
+
+    ret = create_resampler(gInSampleRate, gOutSampleRate, gInChannelNum,
+                            gResample, NULL, &ri);
+    printf("resampler rate: %d -> %d, channels=%d, quality=%d\n",
+            gInSampleRate, gOutSampleRate, gInChannelNum, gResample);
     if (ret != 0) {
+        fprintf(stderr, "create_resampler fail %d\n", ret);
         return -1;
     }
 
-    FILE* fpin = fopen("32000.pcm", "rb");
+    FILE* fpin = fopen(gInFile, "rb");
     if (fpin == NULL) {
-        printf("fail open 32000.pcm\n");
+        printf("fail open %s\n", gInFile);
         release_resampler(ri);
         return -1;
     }
-    FILE* fpout = fopen("44100.pcm", "wb");
+    FILE* fpout = fopen(gOutFile, "wb");
     if (fpout == NULL) {
-        printf("fail open 44100.pcm\n");
+        printf("fail open %s\n", gOutFile);
         release_resampler(ri);
         fclose(fpin);
         return -1;
     }
 
-    size_t frame_size = gChannelNum * (gBits>>3);
+    size_t frame_size = gInChannelNum * (gInBits>>3);
     int8_t* inbuf = new int8_t[gInSampleRate*frame_size];
     int8_t* outbuf = new int8_t[gOutSampleRate*frame_size];
     size_t inFrameCount, outFrameCount;
@@ -411,57 +534,83 @@ int Resample()
     return 0;
 }
 
+static void createSine(void *vbuffer, size_t frames,
+        size_t channels, double sampleRate, double freq)
+{
+    double tscale = 1.0 / sampleRate;
+    int16_t* buffer = (int16_t*)vbuffer;
+    for (size_t i = 0; i < frames; ++i) {
+        double t = i * tscale;
+        double y = sin(2.0 * M_PI * freq * t);
+        int16_t yt = 0.8*floor(y * 32767.0 + 0.5);
+
+        for (size_t j = 0; j < channels; ++j) {
+            buffer[i*channels + j] = yt;
+        }
+    }
+}
+
+int CreateSineFile()
+{
+    int16_t* buffer = NULL;
+    if (gOutChannelNum < 0) gOutChannelNum = CHANNEL_NUM;
+    if (gOutSampleRate < 0) gOutSampleRate = SAMPLE_RATE;
+    if (gOutBits != 16) {
+        printf("MakeSine: only support 16bits!\n");
+        gOutBits = SAMPLE_BITS;
+    }
+
+    FILE *fp = NULL;
+    fp = fopen(gOutFile, "wb");
+    if (fp == NULL) {
+        fprintf(stderr, "Failed to create file: %s\n", gOutFile);
+        return -1;
+    }
+
+    buffer = new int16_t[gOutSampleRate*gOutChannelNum];
+    int i=0;
+    for (i=0; i<gSineTime; i++) {
+        createSine(buffer, gOutSampleRate, gOutChannelNum, gOutSampleRate, gSineFreq);
+        fwrite(buffer, gOutChannelNum*sizeof(int16_t), gOutSampleRate, fp);
+    }
+
+    delete []buffer;
+    fclose(fp);
+
+    printf("CreateSineFile leave\n");
+
+    return 0;
+}
+
 /************************************************************
 *
 *    main in name space
 *
 ************************************************************/
 int exectue() {
-    if (gMode == 0){
-        gOutDevice = (audio_stream_type_t)gDevice;
-        gOutSampleRate = gSampleRate;
-        gOutChannelNum = gChannelNum;
-        gOutBits = gBits;
-
-        if (CheckPlaybackParams() != 0) {
-            printf("Invalid playback params!\n");
+    if (gResample >= 0) {
+        if (gInFile[0] == 0 || gOutFile[0] == 0) {
+            printf("Resample: invalid parameter!\n");
             return -1;
         }
-
-        printf("Playback from file %s to stream %d\n", gFile, gOutDevice);
+        printf("Resample from file %s to file %s\n", gInFile, gOutFile);
+        Resample();
+    } else if (gSineFreq >= 0) {
+        if (gOutFile[0] == 0) {
+            printf("MakeSine: invalid parameter!\n");
+            return -1;
+        }
+        printf("MakeSine: write to file %s \n", gOutFile);
+        CreateSineFile();
+    } else if (gInFile[0] != 0 && gOutDevice >= 0) {
+        printf("Playback from file %s to stream %d\n", gInFile, gOutDevice);
         Playback();
-    } else if (gMode == 1){
-        gInDevice = (audio_source_t)gDevice;
-        gInSampleRate = gSampleRate;
-        gInChannelNum = gChannelNum;
-        gInBits = gBits;
-
-        if (CheckRecordParams() != 0) {
-            printf("Invalid playback params!\n");
-            return -1;
-        }
-
-        printf("Record from source %d to file %s\n", gInDevice, gFile);
+    } else if (gInDevice >= 0 && gOutFile[0] != 0) {
+        printf("Record from source %d to file %s\n", gInDevice, gOutFile);
         Record();
-    } else if (gMode == 2){
-        if (gDevice != -2) {
-            gInDevice = (audio_source_t)gDevice;
-            gOutDevice = (audio_stream_type_t)gDevice;
-        }
-        if (gSampleRate != 44100) gInSampleRate = gOutSampleRate = gSampleRate;
-        if (gChannelNum != 2) gInChannelNum = gOutChannelNum = gChannelNum;
-        if (gBits != 16) gInBits = gOutBits = gBits;
-
-        if (CheckPlaybackParams() != 0 || CheckRecordParams() != 0) {
-            printf("Invalid playback or record params!\n");
-            return -1;
-        }
-
+    } else if (gInDevice >= 0 && gOutDevice >= 0){
         printf("from source %d to stream %d\n", gInDevice, gOutDevice);
         RecordAndPlayback();
-    } else if (gMode == 3) {
-        // resampler
-        Resample();
     }
 
     return 0;
@@ -481,29 +630,30 @@ void exitsig(int x) {
 
 static void showhelp(const char* cmd)
 {
-    fprintf(stderr, "%s [-m mode] [-d source/stream] [-c channels] [-r rate] [-b bits] [-t timer] [file]\n", cmd);
-    fprintf(stderr, "  mode:\n");
-    fprintf(stderr, "       0 - playback\n");
-    fprintf(stderr, "       1 - record\n");
-    fprintf(stderr, "       2 - record & playback\n");
-    fprintf(stderr, "  source:\n");
+    fprintf(stderr, "%s [in options] [out options] [options]\n", cmd);
+    fprintf(stderr, "  --in=<source or file>: read from audio source or file, support source:\n");
     fprintf(stderr, "       1 - build-in mic (default)\n");
     fprintf(stderr, "       8 - remote submix\n");
-    fprintf(stderr, "  stream:\n");
+    fprintf(stderr, "  --out=<device or file>: write to audio device or file, support device:\n");
     fprintf(stderr, "       1 - system\n");
     fprintf(stderr, "       3 - music (default)\n");
-    fprintf(stderr, "  channels:\n");
+    fprintf(stderr, "  --[in or out]-channel=<channels>:\n");
     fprintf(stderr, "       1 - mono\n");
     fprintf(stderr, "       2 - stereo (default)\n");
-    fprintf(stderr, "  rate:\n");
+    fprintf(stderr, "  --[in or out]-rate=<rate>:\n");
     fprintf(stderr, "       44100 (default)\n");
     fprintf(stderr, "       48000\n");
-    fprintf(stderr, "  bits:\n");
+    fprintf(stderr, "  --[in or out]-bits=<bits>:\n");
     fprintf(stderr, "       8\n");
     fprintf(stderr, "       16 (default)\n");
     fprintf(stderr, "       32\n");
-    fprintf(stderr, "  timer: duration time\n");
-    fprintf(stderr, "  file: for read(playback mode) or for write(record mode)\n");
+    fprintf(stderr, "  --resample[=quality]:\n");
+    fprintf(stderr, "        0 - min\n");
+    fprintf(stderr, "       10 - max\n");
+    fprintf(stderr, "        4 (default)\n");
+    fprintf(stderr, "  --sine[=freq]\n");
+    fprintf(stderr, "  --duration=<duration ms>\n");
+    fprintf(stderr, "  --help: print this help.\n");
 }
 
 /************************************************************
@@ -523,75 +673,57 @@ int main(int argc, char** argv)
     signal(SIGILL,exitsig);
     signal(SIGALRM,exitsig);
 
-	int ch;
+	while (1) {
+        int ret;
+        int option_index;
+        static const struct option long_options[] = {
+          { "in",            required_argument, NULL,   'i' },
+          { "in-channel",    required_argument, NULL,   'c' },
+          { "in-rate",       required_argument, NULL,   'r' },
+          { "in-bits",       required_argument, NULL,   'b' },
 
-    int i_arg = 1;
-	while ((ch = getopt(argc, argv, "d:c:r:b:m:t:h")) != -1) {
-        char* p = NULL;
-        ++i_arg;
-		switch(ch) {
-        case 'd':
-            if ((p=strchr(optarg, ','))!=NULL) {
-                android::gInDevice = (audio_source_t)atoi(optarg);
-                android::gOutDevice = (audio_stream_type_t)atoi(p+1);
-            } else
-                android::gDevice = atoi(optarg);
-            ++i_arg;
-            break;
-		case 'c':
-            if ((p=strchr(optarg, ','))!=NULL) {
-                android::gInChannelNum = atoi(optarg);
-                android::gOutChannelNum = atoi(p+1);
-            } else
-                android::gChannelNum = atoi(optarg);
-            ++i_arg;
-			break;
-		case 'r':
-            if ((p=strchr(optarg, ','))!=NULL) {
-                android::gInSampleRate = atoi(optarg);
-                android::gOutSampleRate = atoi(p+1);
-            } else
-    			android::gSampleRate = atoi(optarg);
-            ++i_arg;
-			break;
-		case 'b':
-            if ((p=strchr(optarg, ','))!=NULL) {
-                android::gInBits = atoi(optarg);
-                android::gOutBits = atoi(p+1);
-            } else
-                android::gBits = atoi(optarg);
-            ++i_arg;
-			break;
-        case 'm':
-            android::gMode = atoi(optarg);
-            ++i_arg;
-            break;
-        case 't':
-        {
-            int timer = atoi(optarg);
-            printf("set timer %d\n", timer);
-            alarm(timer);
-            ++i_arg;
+          { "out",           required_argument, NULL,   'o' },
+          { "out-channel",   required_argument, NULL,   'C' },
+          { "out-rate",      required_argument, NULL,   'R' },
+          { "out-bits",      required_argument, NULL,   'B' },
+
+          { "duration",      required_argument, NULL,   't' },
+          { "resample",      optional_argument, NULL,   'q' },
+          { "sine",          optional_argument, NULL,   's' },
+          { "help",          no_argument,       NULL,   'h' },
+          { NULL,            0,                 NULL,    0  }
+        };
+
+        ret = getopt_long(argc, argv, "s:c:r:b:d:C:R:B:t:h",
+                          long_options, &option_index);
+        if (ret < 0) {
             break;
         }
-        case 'h':
-		default:
-			showhelp(argv[0]);
-			exit(-1);
-			break;
-		}
-	}
-
-    if (i_arg<argc) {
-        sprintf(android::gFile, "%s", argv[i_arg]);
-        ++i_arg;
-    }
-
-    if (i_arg != argc) {
-        showhelp(argv[0]);
-        exit(-1);
+        switch (ret) {
+            case 'i':
+                if (optarg[0] >= '0' && optarg[0]<='9')
+                    android::gInDevice = (audio_source_t)atoi(optarg);
+                else
+                    sprintf(android::gInFile, "%s", optarg);
+                break;
+            case 'o':
+                if (optarg[0] >= '0' && optarg[0]<='9')
+                    android::gOutDevice = (audio_stream_type_t)atoi(optarg);
+                else
+                    sprintf(android::gOutFile, "%s", optarg);
+                break;
+            case 'c': android::gInChannelNum = atoi(optarg); break;
+            case 'C': android::gOutChannelNum = atoi(optarg); break;
+            case 'r': android::gInSampleRate = atoi(optarg); break;
+            case 'R': android::gOutSampleRate = atoi(optarg); break;
+            case 'b': android::gInBits = atoi(optarg); break;
+            case 'B': android::gOutBits = atoi(optarg); break;
+            case 't': alarm(atoi(optarg)); break;
+            case 'q': android::gResample = optarg?atoi(optarg):RESAMPLER_QUALITY_DEFAULT; break;
+            case 's': android::gSineFreq = optarg?atoi(optarg):SINE_FREQ; break;
+            case 'h': default: showhelp(argv[0]); exit(-1); break;
+        }
     }
 
     return android::exectue();
 }
-

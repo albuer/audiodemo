@@ -17,8 +17,7 @@ LOCAL_SHARED_LIBRARIES := \
     libc \
     libutils \
     libmedia \
-    libaudioutils \
-    liblog
+    libaudioutils
 
 LOCAL_MODULE_TAGS := tests
 LOCAL_32_BIT_ONLY := true
