@@ -1,12 +1,29 @@
 ## AudioDemo
 用于演示在Android native下AudioTrack和AudioRecord的使用
 
-* 播放pcm文件
-audiodemo -m 0 -d 3 -c 1 -b 16 -r 44100 -t 10 /data/sine_44100_s16_mono.pcm
+* 播放wav文件
 
-* 从内置MIC录制声音
-audiodemo -m 1 -d 1 -c 2 -b 16 -r 44100 -t 10 /data/t1.pcm
+  ```
+  audiodemo --in=/sdcard/demo.wav
+  ```
+
+* 播放pcm文件
+
+  ```
+  audiodemo --in=/sdcard/sine_44100_s16_mono.pcm --in-channel=1 --in-rate=44100 --in-bits=16 
+  ```
+
+* 使用内置MIC录制声音并保存文件
+
+  ```
+  audiodemo --out=/sdcard/demo.pcm --duration=10
+  ```
 
 * 从内置MIC录制声音并立即播放
-audiodemo -m 2 -d 1,3 -c 1,2 -b 16,16 -r 44100,48000 -t 10
+
+  ```
+  audiodemo --duration=5
+  ```
+
+  
 

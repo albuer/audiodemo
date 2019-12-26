@@ -652,7 +652,7 @@ static void showhelp(const char* cmd)
     fprintf(stderr, "       10 - max\n");
     fprintf(stderr, "        4 (default)\n");
     fprintf(stderr, "  --sine[=freq]\n");
-    fprintf(stderr, "  --duration=<duration ms>\n");
+    fprintf(stderr, "  --duration=<seconds>\n");
     fprintf(stderr, "  --help: print this help.\n");
 }
 
