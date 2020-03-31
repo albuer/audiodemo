@@ -25,5 +25,8 @@
   audiodemo --duration=5
   ```
 
-  
+ * ÖØ²ÉÑù
 
+    ```
+    audiodemo --in=96000_2ch.pcm --in-channel=2 --in-rate=96000 --out=44100_2ch.pcm --out-channel=2 --out-rate=44100 --resample
+    ```
