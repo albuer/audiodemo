@@ -19,6 +19,10 @@ LOCAL_SHARED_LIBRARIES := \
     libmedia \
     libaudioutils
 
+ifeq (1,$(strip $(shell expr $(PLATFORM_SDK_VERSION) \>= 26)))
+LOCAL_SHARED_LIBRARIES += libaudioclient
+endif
+
 LOCAL_MODULE_TAGS := tests
 LOCAL_32_BIT_ONLY := true
 LOCAL_CFLAGS += -Wall -Werror -Wno-error=deprecated-declarations -Wunused -Wunreachable-code

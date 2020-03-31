@@ -133,7 +133,7 @@ sp<AudioTrack> allocAudioTrack(void)
         fprintf(stderr, "cannot initialize audio device\n");
         return NULL;
     }
-    printf("alloc AudioTrack success. latency: %d ms\n", track->latency());
+//    printf("alloc AudioTrack success. latency: %d ms\n", track->latency());
 
     return track;
 }
@@ -181,7 +181,7 @@ sp<AudioRecord> allocAudioRecord(void)
         fprintf(stderr, "cannot initialize audio device\n");
         return NULL;
     }
-    printf("alloc AudioRecord success. latency: %d ms\n", record->latency());
+//    printf("alloc AudioRecord success. latency: %d ms\n", record->latency());
 
     return record;
 }
